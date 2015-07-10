@@ -16,7 +16,10 @@ import sys
 PYTHON3 = sys.version >= '3'
 
 if sys.version_info < (3, 2):
-    import futures
+    try:
+        import futures
+    except ImportError:
+        from concurrent import futures
 else:
     from concurrent import futures
 

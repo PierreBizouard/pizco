@@ -120,7 +120,8 @@ class Agent(object):
     """
 
     def __init__(self, rep_endpoint='tcp://127.0.0.1:0', pub_endpoint='tcp://127.0.0.1:0',
-                 ctx=None, loop=default_io_loop, protocol=None):
+                 ctx=None, loop=default_io_loop, protocol=None,
+                 pub_hwm=None, limit_latency_ms =-1):
 
         self._running_lock = threading.Lock()
         self._running = threading.Event()
@@ -131,9 +132,11 @@ class Agent(object):
         #one loop per process
         self.ctx = ctx or zmq.Context.instance()
         self.loop = default_io_loop()
-
         self.protocol = protocol or Protocol(os.environ.get('PZC_KEY', ''),
                                              os.environ.get('PZC_SER', 'pickle'))
+
+        print("limiting latency to {} ms in pub msg".format(limit_latency_ms))
+        self.limit_latency_ms = limit_latency_ms
 
         LOGGER.debug('New agent at %s with context %s and loop %s',
                      rep_endpoint, self.ctx, self.loop)
@@ -154,11 +157,22 @@ class Agent(object):
         pub = self.ctx.socket(zmq.XPUB)
         self.pub_endpoint = bind(pub, pub_endpoint)
 
+        if pub_hwm is not None:
+            print("setting high watermark in pub to {}".format(pub_hwm))
+            pub.set_hwm(pub_hwm)
+            #self.pub_endpoint.hwm = pub_hwm
+
         LOGGER.debug('%s PUB: %s', self.rep_endpoint, self.pub_endpoint)
 
         #: Incoming notification socket
         sub = self.ctx.socket(zmq.SUB)
+
+        if pub_hwm is not None:
+            print("setting high watermark in pub to {}".format(pub_hwm))
+            sub.set_hwm(pub_hwm)
+
         self.sub_endpoint = bind(sub)
+
         LOGGER.debug('%s SUB: %s', self.rep_endpoint, self.sub_endpoint)
 
         #: dict (sender, topic), callback(sender, topic, payload)
@@ -294,7 +308,6 @@ class Agent(object):
             req = self.ctx.socket(zmq.REQ)
             req.connect(recipient)
             self.connections[recipient] = req
-
         msgid = req.send_multipart(self.protocol.format(self.rep_endpoint, '', content, None))
         if req.poll(timeout):
             sender, topic, content, msgid = self.protocol.parse(req.recv_multipart(), recipient, msgid)
@@ -376,8 +389,10 @@ class Agent(object):
         """
         #TODO check issues in loop after restarting not connected
 
+        do_timestamp = False if (self.limit_latency_ms == -1 or topic.startswith("__")) else True
         if not self.pub.closed(): #TODO : would try except be quicker
-            self.pub.send_multipart(self.protocol.format(self.rep_endpoint, topic, content))
+            self.pub.send_multipart(self.protocol.format(self.rep_endpoint, topic, content,
+                                                         timestamping = do_timestamp))
         else:
             if self._running.isSet():
                 LOGGER.error('TRYING TO publish on a closed pub socket %s', self.rep_endpoint)
@@ -502,11 +517,12 @@ class Agent(object):
         elif rep_endpoint not in self.rep_to_pub:
             self.rep_to_pub[rep_endpoint] = pub_endpoint
 
-        agentid_topic  = self.protocol.format(rep_endpoint, topic, just_header=True)
+
+        do_timestamp = False if (self.limit_latency_ms == -1 or topic.startswith("__")) else True
+        agentid_topic  = self.protocol.format(rep_endpoint, topic, just_header=True, timestamping=do_timestamp)
         LOGGER.debug('Subscribing to %s with %s', agentid_topic, callback)
         self.loop.add_callback(lambda: self._subscribe(pub_endpoint, agentid_topic))
         self.notifications_callbacks[(rep_endpoint, topic)] = callback
-        
         
 
     def unsubscribe(self, rep_endpoint, topic, pub_endpoint=None):
@@ -528,7 +544,8 @@ class Agent(object):
             pub_endpoint = ret['pub_endpoint']
             self.rep_to_pub[rep_endpoint] = pub_endpoint
 
-        agentid_topic  = self.protocol.format(rep_endpoint, topic, just_header=True)
+        do_timestamp = False if (self.limit_latency_ms == -1 or topic.startswith("__")) else True
+        agentid_topic  = self.protocol.format(rep_endpoint, topic, just_header=True, timestamping=do_timestamp)
         if (rep_endpoint, topic) in self.notifications_callbacks:
             LOGGER.debug('Unsubscribing to %s', agentid_topic)
             self.loop.add_callback(lambda: self._unsubscribe(pub_endpoint, agentid_topic))
@@ -544,8 +561,12 @@ class Agent(object):
         This methods is executed in the IOLoop thread.
         """
         try:
-            sender, topic, content, msgid = self.protocol.parse(message)
-            LOGGER.debug("RECEIVE notification from %s (topic: %s) ", sender,topic)
+            check_timestamp = 0 if self.limit_latency_ms == -1 else self.limit_latency_ms
+            sender, topic, content, msgid = self.protocol.parse(message,
+                                                                check_timestamp=check_timestamp)
+            LOGGER.debug("RECEIVE notification from %s (topic: %s) %d", sender,topic, check_timestamp)
+        except TimeoutError as e:
+            LOGGER.debug("dropping message due to timestamp older than < %d ms", self.limit_latency_ms)
         except:
             LOGGER.debug('Invalid message %s', message)
         else:

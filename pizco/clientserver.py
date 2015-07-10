@@ -7,6 +7,9 @@
 
     :copyright: 2013 by Hernan E. Grecco, see AUTHORS for more details.
     :license: BSD, see LICENSE for more details.
+    
+    note : revert auto
+
 """
 
 
@@ -98,11 +101,12 @@ def PSMessage(action, options):
 def ServerLauncher(*args, **kwargs):
     import time
     final_rep_endpoint = kwargs.pop("final_rep_endpoint",[])
-    s = Server(*args)
+    s = Server(*args, **kwargs)
     final_rep_endpoint.append(s.rep_endpoint)
     time.sleep(5)
     s.serve_forever()
-    
+
+
 class Server(Agent):
     """Serves an object for remote access from a Proxy. A Server can serve a single object.
 
@@ -113,7 +117,7 @@ class Server(Agent):
     """
 
     def __init__(self, served_object, rep_endpoint='tcp://127.0.0.1:0', pub_endpoint='tcp://127.0.0.1:0',
-                 ctx=None, loop=None):
+                 ctx=None, loop=None, pub_hwm=None, limit_latency_ms=-1):
         try:
             LOGGER.debug("Server start")
             if rep_endpoint.find("*") != -1:
@@ -122,7 +126,8 @@ class Server(Agent):
             if served_object is None:
                 self.did_instantiate = False
             self.signal_calls = {}
-            super(Server, self).__init__(rep_endpoint, pub_endpoint, ctx, loop)
+            super(Server, self).__init__(rep_endpoint, pub_endpoint, ctx, loop,
+                                         pub_hwm=pub_hwm, limit_latency_ms=limit_latency_ms)
         except:
             import traceback
             LOGGER.error(traceback.format_exc())
@@ -274,10 +279,14 @@ class Server(Agent):
         
     @classmethod
     def serve_in_thread(cls, served_cls, args, kwargs,
-                        rep_endpoint='tcp://127.0.0.1:0', pub_endpoint='tcp://127.0.0.1:0'):
+                        rep_endpoint='tcp://127.0.0.1:0', pub_endpoint='tcp://127.0.0.1:0',
+                        pub_hwm=None, limit_latency_ms=-1):
 
         final_rep_endpoint = []
-        t = threading.Thread(target=ServerLauncher, args=(None, rep_endpoint, pub_endpoint),kwargs={"final_rep_endpoint":final_rep_endpoint})
+        t = threading.Thread(target=ServerLauncher, args=(None, rep_endpoint, pub_endpoint),
+                             kwargs={"pub_hwm":pub_hwm,
+                                     "limit_latency_ms": limit_latency_ms,
+                                    "final_rep_endpoint":final_rep_endpoint})
 
         t.start()
         while not final_rep_endpoint:
@@ -289,7 +298,7 @@ class Server(Agent):
         else:
             pxy_endpoint = rep_endpoint
 
-        proxy = Proxy(pxy_endpoint)
+        proxy = Proxy(pxy_endpoint, limit_latency_ms=limit_latency_ms)
         proxy._proxy_agent.instantiate(served_cls, args, kwargs)
         proxy._proxy_inspection()
 
@@ -299,28 +308,34 @@ class Server(Agent):
 
     @classmethod
     def serve_in_process(cls, served_cls, args, kwargs,
-                         rep_endpoint, pub_endpoint='tcp://127.0.0.1:0',
+                         rep_endpoint='tcp://127.0.0.1:0', pub_endpoint='tcp://127.0.0.1:0',
                          daemon=True,
-                         verbose=False, gui=False):
+                         hverbose=False, gui=False,
+                         pub_hwm=None,
+                         limit_latency_ms=-1):
 
         manager = Manager()
         final_rep_endpoint = manager.list()
-        p = Process(target=ServerLauncher, args=(None, rep_endpoint, pub_endpoint),kwargs={"final_rep_endpoint":final_rep_endpoint})
-        p.daemon=daemon
+        p = Process(target=ServerLauncher, args=(None, rep_endpoint, pub_endpoint),
+                                                kwargs={"pub_hwm":pub_hwm,
+                                                        "limit_latency_ms":limit_latency_ms,
+                                                        "final_rep_endpoint":final_rep_endpoint})
+        p.daemon = daemon
         p.start()
         import time
         while not final_rep_endpoint:
             pass
         rep_endpoint = final_rep_endpoint[0]
+        manager.shutdown()
 
         if rep_endpoint.find("*") != -1:
             pxy_endpoint = rep_endpoint.replace("*", "127.0.0.1")
         else:
             pxy_endpoint = rep_endpoint
-        proxy = Proxy(pxy_endpoint)
+
+        proxy = Proxy(pxy_endpoint, limit_latency_ms=limit_latency_ms)
         proxy._proxy_agent.instantiate(served_cls, args, kwargs)
         proxy._proxy_inspection()
-
         return proxy
 
     def serve_forever(self):
@@ -370,7 +385,8 @@ class Server(Agent):
         return {"remote_rep_endpoint":self.rep_endpoint}
 
     def __setstate__(self, state):
-        print("seting state")
+        from pizco import Proxy
+        LOGGER.error(state["remote_rep_endpoint"])
         self.__class__ = Proxy
         self = Proxy.__init__(self,state["remote_rep_endpoint"])
         print("calling creation")
@@ -399,8 +415,8 @@ class ProxyAgent(Agent):
     :param remote_rep_endpoint: REP endpoint of the Server.
     """
 
-    def __init__(self, remote_rep_endpoint, creation_timeout=0):
-        super(ProxyAgent, self).__init__()
+    def __init__(self, remote_rep_endpoint, creation_timeout=0, limit_latency_ms=-1):
+        super(ProxyAgent, self).__init__(limit_latency_ms=limit_latency_ms)
 
         self._remote_stopping = threading.Event()
         self._remote_stopping.clear()
@@ -414,6 +430,9 @@ class ProxyAgent(Agent):
 
         ret = self.request(self.remote_rep_endpoint, 'info')
         self.remote_pub_endpoint = ret['pub_endpoint']
+
+        if limit_latency_ms != -1:
+            LOGGER.debug("Limiting latency {}".format(limit_latency_ms))
 
         LOGGER.debug('Started Proxy pointing to REP: %s and PUB: %s',
                      self.remote_rep_endpoint, self.remote_pub_endpoint)
@@ -527,7 +546,7 @@ class ProxyAgent(Agent):
 
     def wait_server_stop(self,timeout=None):
         return self._remote_stopping.wait(timeout)
-                        
+
     def on_future_completed(self, sender, topic, content, msgid):
         try:
             fut = self._futures[content['msgid']]
@@ -590,8 +609,8 @@ class Proxy(object):
 
     :param remote_endpoint: endpoint of the server.
     """
-    def __init__(self, remote_endpoint,creation_timeout=0, ):
-        self._proxy_agent = ProxyAgent(remote_endpoint, creation_timeout)
+    def __init__(self, remote_endpoint,creation_timeout=0, limit_latency_ms=-1):
+        self._proxy_agent = ProxyAgent(remote_endpoint, creation_timeout, limit_latency_ms=limit_latency_ms)
         self._proxy_attr_as_remote = []
         self._proxy_attr_as_object = []
         self._proxy_signals = {}
@@ -643,7 +662,7 @@ class Proxy(object):
 
     def _proxy_rep_endpoint(self):
         return self._proxy_agent.remote_rep_endpoint
-        
+
     def _proxy_stop_me(self):
         self._proxy_agent.stop()
         self._proxy_wait_stop()

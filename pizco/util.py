@@ -12,6 +12,9 @@
 import inspect
 import traceback
 import types
+from .compat import *
+if not PYTHON3:
+    import functools
 
 class SignalError(Exception):
     pass
@@ -24,6 +27,10 @@ def specable(f):
     except:
         return False
 
+def spec_partial(obj):
+    return inspect.ArgSpec(
+            [], None, None, [])
+        
 def spec_builtin(obj):
    """ Describe a builtin function """
    # Built-in functions cannot be inspected by
@@ -86,6 +93,10 @@ def getspec(f):
     if isinstance(f,types.BuiltinMethodType):
         return spec_builtin(f)
 
+    if not PYTHON3:
+        if isinstance(f, functools.partial):
+            return spec_partial(f)
+        
     # TODO handle partials
     raise ValueError(
         "getspec doesn't know how to get function spec from type {0}".format(

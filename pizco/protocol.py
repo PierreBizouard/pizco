@@ -15,6 +15,7 @@ import uuid
 import hmac
 import json
 import hashlib
+import time
 
 if sys.version_info < (3, 0):
     import cPickle as pickle
@@ -49,14 +50,14 @@ class Protocol(object):
     """
 
     HEADER = 'PZC00'
-
+    HEADER_TS = 'PZCT0'
     NEWID = lambda _: uuid.uuid4().urn
 
     def __init__(self, hmac_key='', serializer=None):
         self.hmac_key = hmac_key.encode('utf-8')
         self.serializer = serializer or 'pickle'
 
-    def parse(self, message, check_sender=None, check_msgid=None):
+    def parse(self, message, check_sender=None, check_msgid=None, check_timestamp=None):
         """Return a parsed message.
 
         :param message: the message as obtained by socket.recv_multipart.
@@ -66,9 +67,9 @@ class Protocol(object):
         :raise: ValueError if messages is malformed or verification fails.
         """
 
-        return self._parse(self.hmac_key, message, check_sender, check_msgid)
+        return self._parse(self.hmac_key, message, check_sender, check_msgid, check_timestamp)
 
-    def _parse(self, key, message, check_sender=None, check_msgid=None):
+    def _parse(self, key, message, check_sender=None, check_msgid=None, check_timestamp=None):
 
         try:
             signed, signature = message[:4], message[4]
@@ -87,8 +88,8 @@ class Protocol(object):
         except:
             raise ValueError('Could not decode or split message parts from UTF-8 bytes.')
 
-        if header != self.HEADER:
-            raise ValueError('Wrong header. In server: {0}, received: {1}'.format(self.HEADER, header))
+        if header != Protocol.HEADER and header != Protocol.HEADER_TS:
+            raise ValueError('Wrong header. In server: {0}/{1}, received: {2}'.format(self.HEADER, self.HEADER_TS, header))
 
         if check_sender and check_sender != sender and sender.find("tcp://*") == -1:
             #todo verify port also
@@ -105,11 +106,21 @@ class Protocol(object):
             else:
                 raise ValueError('Invalid serializer: {0}'.format(serializer))
         except Exception as ex:
-            raise ValueError('Could not deserialize content: {0}'.format(ex))
+            import traceback
+            raise ValueError('Could not deserialize content: {0}'.format(traceback.format_exc()))
+
+        if header == Protocol.HEADER_TS:
+            if not check_timestamp:
+                content = content[-1] #keep only last message part drops the timestam
+            if check_timestamp:
+                current_ts = time.time()
+                if (current_ts - content[0]) > check_timestamp/1000.:
+                    raise TimeoutError("Timestamp")
+                content = content[-1]
 
         return sender, topic, content, msgid
 
-    def format(self, sender, topic='', content='', msgid=None, just_header=False):
+    def format(self, sender, topic='', content='', msgid=None, just_header=False, timestamping=False):
         """Return a formatted message.
 
         :param sender: unique identifier of the sender as string.
@@ -120,9 +131,12 @@ class Protocol(object):
         :return: formatted message
         :rtype: list of bytes
         """
-        return self._format(self.hmac_key, self.serializer, sender, topic, content, msgid, just_header)
+        return self._format(self.hmac_key, self.serializer, sender, topic, content, msgid, just_header, timestamping)
 
-    def _format(self, key, serializer, sender, topic='', content='', msgid=None, just_header=False):
+    def _format(self, key, serializer, sender, topic='', content='', msgid=None, just_header=False, timestamping=False):
+
+        content = content if not timestamping else (self._timestamp(), content)
+
         try:
             if serializer.startswith('pickle'):
                 version = int(serializer[6:] or -1)
@@ -132,14 +146,19 @@ class Protocol(object):
             else:
                 raise ValueError('Unknown serializer {0}'.format(serializer))
         except Exception as ex:
-            raise ValueError('Could not serialize content with {0}'.format(ex))
+            import traceback
+            raise ValueError('Could not serialize content with tb:{0} topic:{1} sender:{2}'.format(content, topic, sender))
+
+        hdr = self.HEADER if not timestamping else self.HEADER_TS
 
         if just_header:
-            return (self.HEADER + '+' + sender + '+' + topic).encode('utf-8')
-        parts = [(self.HEADER + '+' + sender + '+' + topic).encode('utf-8'),
+            return (hdr + '+' + sender + '+' + topic).encode('utf-8')
+
+        parts = [(hdr + '+' + sender + '+' + topic).encode('utf-8'),
                  serializer.encode('utf-8'),
                  content,
                  (msgid or self.NEWID()).encode('utf-8')]
+
         return parts + [self._signature(key, parts), ]
 
     def _signature(self, key, parts):
@@ -147,3 +166,6 @@ class Protocol(object):
             return b''
         msg = b''.join(parts)
         return hmac.new(key, msg, digestmod=hashlib.sha1).digest()
+
+    def _timestamp(self):
+        return time.time()
